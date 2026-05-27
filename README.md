@@ -64,7 +64,7 @@ README.md
 
 ## Setup
 
-**CRITICAL: Set your screen resolution at the top of the script:**
+**IMPORTANT: Set your screen resolution at the top of the script:**
 
 ```python
 SCREEN_W = 2560  # your monitor width
@@ -270,27 +270,6 @@ USE_BUSY_WAIT_FOR_FAST = False
 
 ---
 
-## Version Comparison
-
-| Feature | v0.1.0 | v0.2.0 | v1.0.0 |
-|---------|--------|--------|--------|
-| Basic movement | ✅ | ✅ | ✅ |
-| Arc mode | ✅ | ✅ improved | ✅ improved |
-| Slider support (L/B) | ✅ | ✅ | ✅ |
-| Slider support (P/C) | ❌ | ✅ | ✅ |
-| Stream detection | ❌ | ✅ | ✅ fast-path |
-| Stream smoothing | ❌ | ✅ | ✅ adaptive |
-| Click jitter | ❌ | ✅ | ✅ adaptive |
-| Predictive movement | ❌ | ✅ | ✅ |
-| Auto-start | ❌ | ✅ | ✅ |
-| Relax mode toggle | ❌ | ✅ | ✅ |
-| Fast jump busy-wait | ❌ | ❌ | ✅ |
-| Velocity cap | capped | capped | disabled (999999) |
-| Fast jump accuracy | Excellent | Good | Excellent |
-| Stability | Rock solid | Slightly less reliable | Solid |
-
----
-
 ## Notes
 
 - **osu!lazer only**, does not work with osu!stable
@@ -298,17 +277,6 @@ USE_BUSY_WAIT_FOR_FAST = False
 - I'm not responsible for any bans or consequences
 - Leave `GAME_OFFSET_MS` at 0 unless you know what you're doing
 - `EARLY_HIT_MS` is deprecated, use `HIT_BIAS_MS` instead
-
----
-
-## Contributing
-
-Issues and PRs welcome, especially for:
-
-- Performance optimisations
-- Additional curve types
-- Improved prediction algorithms
-- Better stream pattern recognition
 
 ---
 
