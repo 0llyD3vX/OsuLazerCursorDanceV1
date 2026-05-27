@@ -102,24 +102,24 @@ With `AUTO_START = True` (default), pressing `Q` arms the bot and it starts auto
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `SCREEN_W` / `SCREEN_H` | `2560` / `1440` | **Must match your actual resolution** |
+| `SCREEN_W` / `SCREEN_H` | `2560` / `1440` | **Must match your actual resolution, set to 2k by default** |
 | `PF_HEIGHT_PCT` | `0.80` | Playfield height as fraction of screen |
 | `PF_TOP_PCT` | `0.095` | Playfield top position |
 | `PF_Y_OFFSET` | `15` | Fine-tune vertical alignment |
-| `CURSOR_SENS` | `1.52` | Cursor sensitivity scaling |
+| `CURSOR_SENS` | `1.0` | Do not touch this, it will work no matter your sensitivity |
 
 ### Movement Tuning
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `MOVEMENT_MODE` | `"predictive"` | `linear` / `arc` / `predictive` |
-| `ARC_MODE` | `True` | Enable sine-wave cursor arcs between notes |
+| `ARC_MODE` | `True` | Enable arcs between notes |
 | `ARC_MAX_AMPLITUDE` | `60` | Maximum arc offset in pixels |
 | `ARC_MIN_AMPLITUDE` | `15` | Minimum arc offset in pixels |
 | `ARC_MAX_DISTANCE` | `400` | Distance at which arc reaches max amplitude |
-| `ARC_CYCLES` | `0.5` | Sine cycles per note-to-note movement |
+| `ARC_CYCLES` | `0.5` | Sine cycles per movement |
 | `ARC_STREAM_THRESH_PX` | `100` | Distances below this suppress the arc |
-| `ARC_EXP_BASE` | `0.12` | Arc falloff rate (leave as-is) |
+| `ARC_EXP_BASE` | `0.12` | Arc falloff rate (leave as is) |
 | `SPINNER_RPM` | `350` | Spinner angular speed |
 | `SPINNER_RADIUS` | `90` | Spinner circle radius in pixels |
 
@@ -128,7 +128,7 @@ With `AUTO_START = True` (default), pressing `Q` arms the bot and it starts auto
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `FAST_JUMP_THRESHOLD_MS` | `50` | Segments shorter than this are treated as fast jumps |
-| `DISABLE_ARC_ON_FAST_JUMPS` | `True` | Suppress arc on very high-speed segments |
+| `DISABLE_ARC_ON_FAST_JUMPS` | `True` | Suppress arc on very high speed segments |
 | `DISABLE_JITTER_ON_FAST` | `True` | No click jitter on fast jumps |
 | `MAX_JUMP_SPEED_PX_MS` | `15` | Arc disable threshold in pixels/ms |
 | `USE_BUSY_WAIT_FOR_FAST` | `True` | Busy-wait loop for precise timing on fast segments |
