@@ -1,4 +1,4 @@
-# osu!relax v1.0.1
+# osu!relax v1.1.0
 
 Advanced relax/assist bot for osu!lazer on Windows. Features predictive movement, stream detection, a dynamic arc system, and configurable click jitter for human-like patterns.
 
