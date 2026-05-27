@@ -21,8 +21,17 @@ SYNC_HOTKEY    = "q"    # press this key before any notes play inside the map to
 STOP_HOTKEY    = "w"    # press this to stop
 CLICK_KEYS     = ["z", "x"]
 GAME_OFFSET_MS = 0    # dont touch this (it doesnt do much)
-HIT_BIAS_MS    = 0   # reverse sign (positive ingame offset = negative one here)
+HIT_BIAS_MS    = -10   # reverse sign (positive ingame offset = negative one here)
 CURSOR_SENS    = 1# breaks things, script has been changed to work with any sens so keep this at one even if your sensitivity is 2.0 for example
+
+# Click accuracy guard (helps rare misses on large jumps)
+ENABLE_CLICK_POS_GATE   = True   # only click once cursor is close enough to target
+CLICK_POS_WINDOW_PX     = 48.0   # allowed radius (screen pixels) around note position
+CLICK_POS_MAX_LATE_MS   = 18.0   # how long after scheduled time we may wait to be in-window
+CLICK_POS_POLL_SLEEP_S  = 0.0002 # small sleep while waiting (seconds)
+ENABLE_JUMP_EARLY_LEAD  = True   # schedule clicks a bit earlier on big jumps (gate prevents premature click)
+JUMP_EARLY_LEAD_PX_PER_MS = 90.0 # higher = less lead; tuned for typical Windows input latency
+JUMP_EARLY_LEAD_MAX_MS    = 10.0 # clamp (ms)
 
 # Movement Tuning
 MOVEMENT_MODE  = "predictive"   # linear / arc / predictive
@@ -55,8 +64,8 @@ MAX_JUMP_SPEED_PX_MS     = 15      # arc disable threshold (pixels per ms)
 USE_BUSY_WAIT_FOR_FAST   = True    # busy-wait for precise timing on fast segments
 
 # Display Setup
-SCREEN_W = 1920
-SCREEN_H = 1080
+SCREEN_W = 2560
+SCREEN_H = 1440
 PF_HEIGHT_PCT = 0.80
 PF_TOP_PCT    = 0.095
 PF_Y_OFFSET   = 15        # if notes are hit too high/low change this
@@ -98,6 +107,14 @@ PF_LEFT, PF_TOP, PF_W, PF_H = _pf()
 
 def now():
     return time.perf_counter()
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+def get_cursor_pos():
+    p = _POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
+    return float(p.x), float(p.y)
 
 
 def osu_to_screen(ox, oy):
@@ -1148,6 +1165,7 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
 
     key_idx = 0
     prev_time = None
+    prev_key_xy = None
 
     for obj in objects:
         hit_wall = sync_wall + ((obj["time_ms"] + GAME_OFFSET_MS) - first_note_ms) / 1000.0 / rate
@@ -1170,8 +1188,15 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
         prev_time = obj["time_ms"]
 
         jitter = next_click_jitter_ms(gap_ms)
-        keys.append((hit_wall + HIT_BIAS_MS / 1000.0 + jitter/1000.0, end_wall, key,
-                     obj["is_spinner"], obj["is_slider"], tx, ty))
+        lead_ms = 0.0
+        if ENABLE_CLICK_POS_GATE and ENABLE_JUMP_EARLY_LEAD and prev_key_xy is not None:
+            dist = math.hypot(tx - prev_key_xy[0], ty - prev_key_xy[1])
+            lead_ms = min(JUMP_EARLY_LEAD_MAX_MS, dist / max(1e-6, JUMP_EARLY_LEAD_PX_PER_MS))
+
+        press_wall = hit_wall + HIT_BIAS_MS / 1000.0 + jitter / 1000.0 - (lead_ms / 1000.0)
+        keys.append((press_wall, end_wall, key,
+                      obj["is_spinner"], obj["is_slider"], tx, ty))
+        prev_key_xy = (tx, ty)
 
     segments = build_movement_segments(objects, sync_wall, first_note_ms, rate)
 
@@ -1427,6 +1452,17 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
             if stop_evt.is_set():
                 return
             sleep_until(press_wall)
+
+            if ENABLE_CLICK_POS_GATE and not stop_evt.is_set():
+                deadline = press_wall + (CLICK_POS_MAX_LATE_MS / 1000.0)
+                while True:
+                    cx, cy = get_cursor_pos()
+                    if (cx - sx) * (cx - sx) + (cy - sy) * (cy - sy) <= (CLICK_POS_WINDOW_PX * CLICK_POS_WINDOW_PX):
+                        break
+                    if now() >= deadline or stop_evt.is_set():
+                        break
+                    time.sleep(CLICK_POS_POLL_SLEEP_S)
+
             key_down(key)
             if is_spinner and end_wall:
                 sleep_until(end_wall)
