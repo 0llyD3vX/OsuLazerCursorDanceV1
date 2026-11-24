@@ -7,6 +7,7 @@ import bisect
 import json
 import math
 import os
+import random
 import threading
 import time
 import websocket
@@ -14,15 +15,31 @@ import keyboard
 
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 
+RELEASE_NAME = "v1.2.0 Final Release"
+RELEASE_VERSION = "1.2.0-final"
+
 ################# START OF CONFIG ##############################################
 
+# =============================== MODES =======================================
+# Edit this small section to choose how the bot behaves.  Leave both false for
+# the normal full-auto mode.  Only one special mode may be enabled at a time.
+MODE_RELAX  = False  # True: tap notes, but do not move the cursor
+MODE_MAGNET = False  # True: move only in the final magnet window; never tap
+
+if MODE_RELAX and MODE_MAGNET:
+    raise ValueError("MODE_RELAX and MODE_MAGNET cannot both be True")
+
+# Internal compatibility names used by the older movement/click pipeline.
+RELAX_MODE   = MODE_RELAX
+MOVEMENT_MODE = "magnet" if MODE_MAGNET else "predictive"
+
 # Hotkeys & Input
-SYNC_HOTKEY    = "q"    # press this key before any notes play inside the map to start
+SYNC_HOTKEY    = "q"    # arm before playing; AUTO_START syncs on the first live update
 STOP_HOTKEY    = "w"    # press this to stop
 CLICK_KEYS     = ["z", "x"]
-GAME_OFFSET_MS = 0    # dont touch this (it doesnt do much)
-HIT_BIAS_MS    = -10   # reverse sign (positive ingame offset = negative one here)
-CURSOR_SENS    = 1# breaks things, script has been changed to work with any sens so keep this at one even if your sensitivity is 2.0 for example
+GAME_OFFSET_MS = 0      # shifts the map timeline; normally leave at 0
+HIT_BIAS_MS    = 10        # positive = later, negative = earlier
+CURSOR_SENS    = 1.51   # compensates cursor displacement around the playfield centre
 
 # Click accuracy guard (helps rare misses on large jumps)
 ENABLE_CLICK_POS_GATE   = True   # only click once cursor is close enough to target
@@ -33,11 +50,10 @@ ENABLE_JUMP_EARLY_LEAD  = True   # schedule clicks a bit earlier on big jumps (g
 JUMP_EARLY_LEAD_PX_PER_MS = 90.0 # higher = less lead; tuned for typical Windows input latency
 JUMP_EARLY_LEAD_MAX_MS    = 10.0 # clamp (ms)
 
-# Movement Tuning
-MOVEMENT_MODE  = "predictive"   # linear / arc / predictive
+# Movement Tuning (normally leave the mode above as the single source of truth)
 ARC_MODE          = True      # for arcs in between notes
-ARC_MAX_AMPLITUDE  = 60    # arc size
-ARC_MIN_AMPLITUDE  = 15
+ARC_MAX_AMPLITUDE  = 24    # arc size
+ARC_MIN_AMPLITUDE  = 13
 ARC_MAX_DISTANCE   = 400
 ARC_CYCLES        = 0.5        # keep this the same for a single arc
 ARC_STREAM_THRESH_PX = 100       # any distance closer than this will not have an arc
@@ -45,23 +61,54 @@ ARC_EXP_BASE       = 0.12      # diminishing arc (best to leave this)
 SPINNER_RPM    = 350         # spinner speed (does not correlate to ingame so play with it)
 SPINNER_RADIUS = 90
 
+# Magnet: subtle sticky pull toward the note.  Only assists when you are
+# outside the hit circle but nearby — stops once you're inside so it can't
+# overshoot through the centre.
+# Turn OFF osu! "High precision mouse" (raw input) so GetCursorPos matches aim.
+MAGNET_WINDOW_MS = 140.0          # pre-hit assist window
+MAGNET_TRIGGER_BUFFER_PX = 210.0  # must already be near the circle
+MAGNET_PULL_STRENGTH = 0.23       # gravity strength (error fraction / tick)
+MAGNET_MAX_STEP_PX = 4.5          # hard cap per tick
+MAGNET_STOP_INSET_PX = 5.0        # stop completely once this far inside the circle
+MAGNET_HOLD_AFTER_MS = 20.0       # brief stick after hit time
+MAGNET_TICK_MS = 7.0              # poll rate — keep low to avoid input lag
+MAGNET_Y_BIAS_PX = 0.0            # +N aims lower if pull still feels high; try 8–20
+
 # Features
-RELAX_MODE        = False      # only tapping (this is fun)
 AUTO_START        = True       # keep this on
 PREDICT_NOTES     = 5         # best to keep this at 5 unless you have a low end device
 STREAM_MS_THRESH  = 250        # smallest time between notes to detect a stream
-DEBUG_MOVEMENT    = False     # didnt work :(
-STREAM_SMOOTH     = True       # smooth streams
-STREAM_SMOOTH_PASSES = 2
-STREAM_SMOOTH_ALPHA  = 0.28
-STREAM_SAMPLES_PER_OSUPX = 0.4
-
 # Fast jump tuning (new)
 FAST_JUMP_THRESHOLD_MS   = 50      # notes faster than this are "fast jumps"
 DISABLE_ARC_ON_FAST_JUMPS = True   # disable arc for very fast jumps
 DISABLE_JITTER_ON_FAST = True      # no jitter on fast jumps
 MAX_JUMP_SPEED_PX_MS     = 15      # arc disable threshold (pixels per ms)
 USE_BUSY_WAIT_FOR_FAST   = True    # busy-wait for precise timing on fast segments
+
+# Final-release timing and cursor feel
+# Edit these values here.  A positive map compensation starts input this many
+# milliseconds early to account for the usual 10-20 ms map/playback delay.
+MAP_DELAY_COMPENSATION_MS = 15.0
+TIMING_WINDOW_MS           = 25.0    # click variation: +/- this amount
+TARGET_OFFSET_OSU_PX       = 5.0   # avoid repeatedly aiming at exact object centres
+STARTUP_SMOOTHING_MS       = 180.0 # travel into the first object over this window
+MIN_TAP_HOLD_MS             = 8.0
+STREAM_TAP_HOLD_MS          = 16.0
+NORMAL_TAP_HOLD_MS          = 24.0
+HOLD_VARIATION_MS           = 4.0
+
+# Humanized motion model.  These are deliberately small in playfield pixels:
+# every perturbation remains inside the active hit region instead of changing
+# the authored object geometry.
+TARGET_SIGMA_OSU_PX         = 0.12   # normal-distributed object landing spread
+SLIDER_DRIFT_SIGMA_OSU_PX   = 0.20   # correlated drift around the slider path
+SLIDER_LAG_OSU_PX           = 0.35   # small tangential lag while tracking
+TREMOR_SIGMA_SCREEN_PX      = 0.08   # high-frequency physiological/sensor noise
+TREMOR_WANDER_SCREEN_PX     = 0.12   # slow, non-systematic hand wander
+OVERSHOOT_PROBABILITY       = 0.08
+OVERSHOOT_MAX_SCREEN_PX     = 4.0
+MOTOR_PROFILE_ALPHA         = 1.35
+MOTOR_PROFILE_BETA          = 3.25
 
 # Display Setup
 SCREEN_W = 2560
@@ -74,6 +121,14 @@ USE_VIRTUAL_DESK = False
 
 # Tosu
 TOSU_WS_URL = "ws://localhost:24050/websocket/v2"
+# Tosu can report state=play while the audio clock is still parked at 0
+# during the pre-start phase.  Do not anchor auto-start to that packet.
+AUTO_START_MIN_LIVE_MS = 5.0
+# osu! automatically gives a beatmap at least 1.8 seconds before its first
+# hit object.  Tosu's early play packet does not always include that padding
+# in `live`, so the bot must reproduce it when anchoring from that packet.
+OSU_MIN_LEAD_IN_MS = 1800.0
+AUTO_PRESTART_CLOCK_MAX_MS = 50.0
 
 ################# END OF CONFIG ##############################################
 
@@ -91,7 +146,7 @@ TIMING_SPIN_WINDOW     = 0.0005
 CIRCLE_DET_THRESHOLD   = FLOAT_EPSILON
 TINY_ARC_THRESHOLD     = FLOAT_EPSILON * 10
 MAX_CURSOR_DELTA_PX    = 999999.0   # effectively disabled - was causing missed fast jumps
-CLICK_VARIATION_MS     = 9.0        # half-width of click timing window
+CLICK_VARIATION_MS     = TIMING_WINDOW_MS
 
 # Playfield
 
@@ -118,17 +173,24 @@ def get_cursor_pos():
 
 
 def osu_to_screen(ox, oy):
+    tx, ty = osu_to_screen_raw(ox, oy)
+    # Full-auto absolute aiming still needs sensitivity compensation.
+    if CURSOR_SENS and CURSOR_SENS != 1.0:
+        cx = PF_LEFT + PF_W * 0.5
+        cy = PF_TOP  + PF_H * 0.5
+        tx = cx + (tx - cx) / float(CURSOR_SENS)
+        ty = cy + (ty - cy) / float(CURSOR_SENS)
+    return tx, ty
+
+
+def osu_to_screen_raw(ox, oy):
+    """Playfield → screen with no CURSOR_SENS warp (visual note position)."""
     ox = float(ox)
     oy = float(oy)
     ox = max(-OSU_OOB_MARGIN, min(float(OSU_W) + OSU_OOB_MARGIN, ox))
     oy = max(-OSU_OOB_MARGIN, min(float(OSU_H) + OSU_OOB_MARGIN, oy))
     tx = PF_LEFT + (ox / OSU_W) * PF_W
     ty = PF_TOP  + (oy / OSU_H) * PF_H
-    if CURSOR_SENS and CURSOR_SENS != 1.0:
-        cx = PF_LEFT + PF_W * 0.5
-        cy = PF_TOP  + PF_H * 0.5
-        tx = cx + (tx - cx) / float(CURSOR_SENS)
-        ty = cy + (ty - cy) / float(CURSOR_SENS)
     return tx, ty
 
 def screen_to_osu(sx, sy):
@@ -147,6 +209,16 @@ def lerp(start, end, amount):
 def ease(t):
     t = max(0.0, min(1.0, t))
     return 3 * t * t - 2 * t * t * t
+
+
+def asymmetric_motor_profile(t, alpha=MOTOR_PROFILE_ALPHA, beta=MOTOR_PROFILE_BETA):
+    """Asymmetric bell-curve progress: fast launch, long fine-control tail."""
+    t = max(0.0, min(1.0, float(t)))
+    if t <= 0.0 or t >= 1.0:
+        return t
+    a = t ** alpha
+    b = (1.0 - t) ** beta
+    return a / (a + b)
 
 smooth_easing = ease
 
@@ -183,7 +255,7 @@ def apply_predictive_arc(elapsed, dt, x1, y1, x2, y2, dist_osu_px,
                           pred_dir_x=None, pred_dir_y=None):
     if dt <= 0:
         return x1, y1
-    
+
     # SIMPLE FALLBACK: For very large jumps, use the first script's method
     # This ensures reliability on big jumps
     if dist_osu_px > 250:  # Very large jumps
@@ -192,11 +264,11 @@ def apply_predictive_arc(elapsed, dt, x1, y1, x2, y2, dist_osu_px,
         dx = x2 - x1
         dy = y2 - y1
         dist = math.sqrt(dx*dx + dy*dy)
-        
-        eased_phase = smooth_easing(phase)
+
+        eased_phase = asymmetric_motor_profile(phase)
         x = x1 + dx * eased_phase
         y = y1 + dy * eased_phase
-        
+
         if dist > 0:
             perp_x = -dy / dist
             perp_y = dx / dist
@@ -205,7 +277,7 @@ def apply_predictive_arc(elapsed, dt, x1, y1, x2, y2, dist_osu_px,
             offset = wave * 60  # Fixed amplitude like first script
             x += perp_x * offset
             y += perp_y * offset
-        
+
         return int(x), int(y)
 
     dist_factor = min(dist_osu_px / ARC_MAX_DISTANCE, 1.0)
@@ -219,12 +291,12 @@ def apply_predictive_arc(elapsed, dt, x1, y1, x2, y2, dist_osu_px,
         # Still use arc but with reduced amplitude for very fast jumps
         amplitude *= 0.6
         phase = max(0.0, min(1.0, elapsed / dt))
-        eased_phase = smooth_easing(phase)
+        eased_phase = asymmetric_motor_profile(phase)
         return x1 + (x2 - x1) * eased_phase, y1 + (y2 - y1) * eased_phase
 
     phase = max(0.0, min(1.0, elapsed / dt))
     dx, dy = x2 - x1, y2 - y1
-    eased_phase = smooth_easing(phase)
+    eased_phase = asymmetric_motor_profile(phase)
     bx = x1 + dx * eased_phase
     by = y1 + dy * eased_phase
 
@@ -517,28 +589,38 @@ def sample_polyline_linear(points, steps):
 
 # Timing helpers
 
-def sleep_until(wall):
-    while True:
+def sleep_until(wall, stop_event=None):
+    while stop_event is None or not stop_event.is_set():
         remaining = wall - now()
         if remaining <= 0:
-            break
+            return True
         if remaining > TIMING_SPIN_WINDOW:
-            time.sleep(remaining - TIMING_SPIN_WINDOW)
+            delay = remaining - TIMING_SPIN_WINDOW
+            if stop_event is None:
+                time.sleep(delay)
+            elif stop_event.wait(delay):
+                return False
         # spin final window
+    return False
 
 
-def smart_sleep_until(wall):
-    while True:
+def smart_sleep_until(wall, stop_event=None):
+    while stop_event is None or not stop_event.is_set():
         remaining = wall - now()
         if remaining <= 0:
-            break
+            return True
         if remaining > 0.002:  # Changed from 0.005
-            time.sleep(max(0.0001, remaining - 0.001))
+            delay = max(0.0001, remaining - 0.001)
+            if stop_event is None:
+                time.sleep(delay)
+            elif stop_event.wait(delay):
+                return False
         else:
             # Busy wait for final 2ms
-            while now() < wall:
+            while now() < wall and (stop_event is None or not stop_event.is_set()):
                 pass
-            break
+            return stop_event is None or not stop_event.is_set()
+    return False
 
 # .osu parsing
 
@@ -706,7 +788,39 @@ def parse_osu_file(path):
         lines = f.readlines()
     smult = parse_slider_multiplier(lines)
     pts   = parse_timing_points(lines)
-    return parse_hit_objects(lines, smult, pts)
+    cs = 4.0
+    for line in lines:
+        if line.strip().lower().startswith("circlesize:"):
+            try:
+                cs = float(line.split(":", 1)[1].strip())
+            except (ValueError, IndexError):
+                pass
+            break
+    # osu! hit radius in osu pixels; the same window applies to circles and
+    # slider heads/ticks.  Store it on each object for bounded target sampling.
+    hit_radius = hit_radius_from_circle_size(cs)
+    objects = parse_hit_objects(lines, smult, pts)
+    for obj in objects:
+        obj["hit_radius_osu"] = hit_radius
+    return objects
+
+
+def hit_radius_from_circle_size(circle_size):
+    """osu! standard hit radius, in osu! pixels."""
+    cs = max(0.0, min(10.0, float(circle_size)))
+    return max(10.0, (54.4 - 4.48 * cs) * 1.00041)
+
+
+def circle_size_from_tosu(data):
+    """Prefer Tosu's mod-adjusted CS, falling back to the authored CS."""
+    try:
+        stats = data["beatmap"]["stats"]
+        value = stats.get("cs", {}).get("converted")
+        if value is None:
+            value = stats.get("cs", {}).get("original")
+        return float(value) if value is not None else None
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
 
 
 def resolve_path(data):
@@ -861,6 +975,33 @@ def smooth_stream_polyline_corner(points, passes, alpha):
 # Deterministic click jitter
 
 _jitter_counter = 0
+_motion_rng = random.Random()
+_tremor_phase = _motion_rng.random() * math.tau
+_tremor_wander = [0.0, 0.0]
+
+
+def gaussian_point_in_radius(radius_osu):
+    """Sample a 2-D normal landing point, rejecting samples outside the hit window."""
+    radius_osu = max(0.5, float(radius_osu))
+    sigma = max(0.25, radius_osu * TARGET_SIGMA_OSU_PX / 5.0)
+    for _ in range(8):
+        x = _motion_rng.gauss(0.0, sigma)
+        y = _motion_rng.gauss(0.0, sigma)
+        if math.hypot(x, y) <= radius_osu * 0.82:
+            return x, y
+    return 0.0, 0.0
+
+
+def add_micro_tremor(x, y, dt=0.001):
+    """Add tiny high-frequency jitter plus a slowly wandering hand component."""
+    global _tremor_phase, _tremor_wander
+    _tremor_phase += (34.0 + _motion_rng.uniform(-5.0, 5.0)) * max(0.0001, dt)
+    _tremor_wander[0] = 0.985 * _tremor_wander[0] + _motion_rng.gauss(0.0, TREMOR_WANDER_SCREEN_PX * 0.08)
+    _tremor_wander[1] = 0.985 * _tremor_wander[1] + _motion_rng.gauss(0.0, TREMOR_WANDER_SCREEN_PX * 0.08)
+    return (x + _tremor_wander[0] + math.sin(_tremor_phase) * TREMOR_SIGMA_SCREEN_PX
+              + _motion_rng.gauss(0.0, TREMOR_SIGMA_SCREEN_PX * 0.35),
+            y + _tremor_wander[1] + math.cos(_tremor_phase * 1.13) * TREMOR_SIGMA_SCREEN_PX
+              + _motion_rng.gauss(0.0, TREMOR_SIGMA_SCREEN_PX * 0.35))
 
 def next_click_jitter_ms(last_gap_ms=None):
     """
@@ -880,6 +1021,65 @@ def next_click_jitter_ms(last_gap_ms=None):
     return v * CLICK_VARIATION_MS
 
 
+def target_screen_for_object(obj, index):
+    """Return a safe landing point; slider/spinner anchors must stay exact."""
+    if obj.get("is_slider") or obj.get("is_spinner"):
+        return osu_to_screen(obj["x"], obj["y"])
+    radius = float(obj.get("hit_radius_osu", 38.0))
+    ox, oy = gaussian_point_in_radius(radius)
+    return osu_to_screen(obj["x"] + ox, obj["y"] + oy)
+
+
+def humanize_slider_curve(curve, radius_osu):
+    """Add bounded correlated drift, tangential lag, and micro-wobble to a path."""
+    if len(curve) < 2:
+        return curve
+    out = []
+    drift_x = drift_y = 0.0
+    max_drift = max(0.5, float(radius_osu) * 0.42)
+    for i, (x, y) in enumerate(curve):
+        # osu! requires the cursor to arrive exactly at both slider anchors.
+        # Shifting either endpoint creates a visible snap and can lose the
+        # slider head or tail even when the authored path is correct.
+        if i == 0 or i == len(curve) - 1:
+            out.append((x, y))
+            continue
+        prev = curve[max(0, i - 1)]
+        nxt = curve[min(len(curve) - 1, i + 1)]
+        tx, ty = nxt[0] - prev[0], nxt[1] - prev[1]
+        length = math.hypot(tx, ty) or 1.0
+        nx, ny = -ty / length, tx / length
+        drift_x = drift_x * 0.94 + _motion_rng.gauss(0.0, SLIDER_DRIFT_SIGMA_OSU_PX)
+        drift_y = drift_y * 0.94 + _motion_rng.gauss(0.0, SLIDER_DRIFT_SIGMA_OSU_PX)
+        lag = -SLIDER_LAG_OSU_PX * min(1.0, length / 20.0)
+        px = x + max(-max_drift, min(max_drift, drift_x)) + nx * lag
+        py = y + max(-max_drift, min(max_drift, drift_y)) + ny * lag
+        out.append((px, py))
+    return out
+
+
+def jump_progress(seg, phase):
+    """Motor-control timing with an occasional late corrective overshoot."""
+    p = asymmetric_motor_profile(phase, seg.get("profile_alpha", MOTOR_PROFILE_ALPHA),
+                                 seg.get("profile_beta", MOTOR_PROFILE_BETA))
+    bump = math.sin(math.pi * max(0.0, min(1.0, p))) ** 1.35
+    ox, oy = seg.get("overshoot", (0.0, 0.0))
+    return p, ox * bump, oy * bump
+
+
+def tap_hold_ms(gap_ms, index):
+    """Vary ordinary key holds while keeping fast patterns recognisably taps."""
+    if gap_ms is None or gap_ms >= 150.0:
+        base = NORMAL_TAP_HOLD_MS
+    elif gap_ms >= 90.0:
+        base = (STREAM_TAP_HOLD_MS + NORMAL_TAP_HOLD_MS) * 0.5
+    else:
+        base = STREAM_TAP_HOLD_MS
+    variation = math.sin(index * 1.71 + 0.4) * HOLD_VARIATION_MS
+    safe_limit = max(MIN_TAP_HOLD_MS, (gap_ms - 5.0) if gap_ms is not None else base + 8.0)
+    return max(MIN_TAP_HOLD_MS, min(safe_limit, base + variation))
+
+
 # Per-frame velocity cap (effectively unlimited, kept for structure)
 
 _last_cursor_pos = None
@@ -888,11 +1088,14 @@ _last_cursor_time = None
 # Performance monitoring
 _perf_stats = {"cursor_updates": 0, "avg_update_ms": 0.0}
 
-def mouse_move_capped(x, y, is_fast_segment=False):
+def mouse_move_capped(x, y, is_fast_segment=False, apply_tremor=True):
     """Move mouse. Velocity cap is disabled (MAX_CURSOR_DELTA_PX = 999999).
     is_fast_segment flag bypasses the cap check entirely for clarity."""
     global _last_cursor_pos, _last_cursor_time
-    x, y = float(x), float(y)
+    if apply_tremor:
+        x, y = add_micro_tremor(float(x), float(y), 0.001)
+    else:
+        x, y = float(x), float(y)
     now_t = now()
 
     if _last_cursor_pos is not None and not is_fast_segment:
@@ -910,6 +1113,20 @@ def mouse_move_capped(x, y, is_fast_segment=False):
     _perf_stats["cursor_updates"] += 1
     mouse_move(x, y)
 
+_virtual_cursor = [PF_LEFT + PF_W / 2, PF_TOP + PF_H / 2]
+
+def update_virtual_cursor(dx, dy):
+    """Track our best guess of where the cursor is on screen."""
+    global _virtual_cursor
+    _virtual_cursor[0] += dx
+    _virtual_cursor[1] += dy
+    # Clamp to screen bounds
+    _virtual_cursor[0] = max(0, min(PRIMARY_W - 1, _virtual_cursor[0]))
+    _virtual_cursor[1] = max(0, min(PRIMARY_H - 1, _virtual_cursor[1]))
+
+def get_virtual_cursor_pos():
+    """Return estimated cursor position (raw-input safe)."""
+    return _virtual_cursor[0], _virtual_cursor[1]
 
 # Segment builder
 
@@ -928,7 +1145,7 @@ def build_movement_segments(objects, sync_wall, first_note_ms, rate):
             stream_objs = objects[i : end_idx + 1]
             for j, obj in enumerate(stream_objs):
                 hit_wall = sync_wall + ((obj["time_ms"] + GAME_OFFSET_MS) - first_note_ms) / 1000.0 / rate
-                tx, ty = osu_to_screen(obj["x"], obj["y"])
+                tx, ty = target_screen_for_object(obj, i + j)
                 if prev_wall is not None and hit_wall > prev_wall:
                     dt = hit_wall - prev_wall
                     dist = math.hypot(tx - prev_scr[0], ty - prev_scr[1])
@@ -952,7 +1169,7 @@ def build_movement_segments(objects, sync_wall, first_note_ms, rate):
         hit_wall = sync_wall + ((obj["time_ms"] + GAME_OFFSET_MS) - first_note_ms) / 1000.0 / rate
         end_wall = (sync_wall + ((obj["end_time_ms"] + GAME_OFFSET_MS) - first_note_ms) / 1000.0 / rate
                     if obj["end_time_ms"] is not None else None)
-        tx, ty  = osu_to_screen(obj["x"], obj["y"])
+        tx, ty  = target_screen_for_object(obj, i)
 
         if obj["is_slider"] and end_wall:
             if prev_wall is not None and hit_wall > prev_wall:
@@ -969,21 +1186,29 @@ def build_movement_segments(objects, sync_wall, first_note_ms, rate):
             base_curve  = obj["cached_curve"]
             arc_cum     = obj["cached_arc_cum"]
             arc_total   = obj["cached_arc_total"]
+            pixel_length = obj.get("slider_length")
 
             if base_curve is None:
                 curve_points = obj.get("slider_curve_points") or [(obj["x"], obj["y"]), (obj["end_x"], obj["end_y"])]
                 curve_type   = obj.get("slider_curve_type") or "L"
-                pixel_length = obj.get("slider_length")
                 target_len   = float(pixel_length) if pixel_length is not None else 0.0
                 steps = max(180, min(7000, int(target_len * 1.8) + 120))
                 base_curve  = sample_curve(curve_type, curve_points, steps)
                 base_curve, arc_cum, arc_total = truncate_curve_to_length(base_curve, pixel_length)
+
+            base_curve = humanize_slider_curve(base_curve, obj.get("hit_radius_osu", 38.0))
+            # Humanization is bounded around the already-authored path.  Do
+            # not truncate again here: drift changes the polyline length very
+            # slightly, and a second truncation can remove the real slider
+            # tail (especially on short or repeated sliders).
+            arc_cum, arc_total = stream_polyline_arclengths(base_curve)
 
             segments.append({
                 "type": "slider", "start": hit_wall, "end": end_wall,
                 "curve": base_curve, "arc_cum": arc_cum, "arc_total": arc_total,
                 "repeats": int(obj.get("slider_repeats", 1) or 1),
                 "no_arc": True, "locked": True, "is_fast": False,
+                "hit_radius_osu": obj.get("hit_radius_osu", 38.0),
                 "obj_idx": i,
             })
             prev_wall = end_wall
@@ -1019,6 +1244,14 @@ def build_movement_segments(objects, sync_wall, first_note_ms, rate):
 
         i += 1
 
+    for segment in segments:
+        if segment.get("type") == "normal":
+            segment["profile_alpha"] = _motion_rng.uniform(1.15, 1.55)
+            segment["profile_beta"] = _motion_rng.uniform(2.8, 3.8)
+            if segment.get("jump_distance", 0.0) > 30.0 and _motion_rng.random() < OVERSHOOT_PROBABILITY:
+                angle = math.atan2(segment["y2"] - segment["y1"], segment["x2"] - segment["x1"])
+                amount = _motion_rng.uniform(1.5, OVERSHOOT_MAX_SCREEN_PX)
+                segment["overshoot"] = (math.cos(angle) * amount, math.sin(angle) * amount)
     return segments
 
 
@@ -1038,14 +1271,18 @@ state_lock = threading.Lock()
 _state = {
     "current_path":   None,
     "hit_objects":    [],
+    "circle_size":    None,
+    "live_ms":        None,
+    "play_state":     "menu",
     "speed_change":   1.0,
     "stop_event":     threading.Event(),
     "relax_thread":   None,
     "status":         STATE_IDLE,
     "_auto_started":  False,
     "_manual_armed":  False,
-    "_sync_anchor":   None,
     "cursor_target":  (0, 0),
+    "raw_input":      None,
+    "mouse_sensitivity": None,
 }
 
 
@@ -1137,6 +1374,18 @@ def mouse_move(x, y):
                      dwFlags=flags, time=0, dwExtraInfo=0)))])
 
 
+def mouse_move_relative(dx, dy):
+    """Inject a relative mouse delta (raw-input friendly)."""
+    rdx = int(round(float(dx)))
+    rdy = int(round(float(dy)))
+    if rdx == 0 and rdy == 0:
+        return
+    _send([INPUT(type=INPUT_MOUSE,
+                 _input=_INPUT_UNION(mi=MOUSEINPUT(
+                     dx=rdx, dy=rdy, mouseData=0,
+                     dwFlags=MOUSEEVENTF_MOVE, time=0, dwExtraInfo=0)))])
+
+
 def key_down(k):
     _send([INPUT(type=INPUT_KEYBOARD,
                  _input=_INPUT_UNION(ki=KEYBDINPUT(
@@ -1152,11 +1401,103 @@ def key_up(k):
                      time=0, dwExtraInfo=0)))])
 
 
+def build_magnet_notes(objects):
+    """Precompute note times + visual screen centres for the magnet worker."""
+    notes = []
+    # Visual hit radius in screen px — do NOT divide by CURSOR_SENS.
+    # Sens-warping pulls targets toward playfield centre (feels like "always up"
+    # on lower notes). Magnet follows GetCursorPos / what you see instead.
+    scale = PF_W / float(OSU_W)
+    for obj in objects:
+        if obj.get("is_spinner"):
+            continue
+        t = float(obj["time_ms"]) + GAME_OFFSET_MS + MAP_DELAY_COMPENSATION_MS
+        tx, ty = osu_to_screen_raw(float(obj["x"]), float(obj["y"]))
+        ty += MAGNET_Y_BIAS_PX
+        radius = float(obj.get("hit_radius_osu", 38.0)) * scale
+        notes.append((t, tx, ty, radius))
+    return notes
+
+
+def magnet_cursor_worker(objects):
+    """Sticky assist using relative motion — calibrates at startup."""
+    global _virtual_cursor
+    stop_evt = get_state("stop_event")
+    worker_path = get_state("current_path")
+    notes = build_magnet_notes(objects)
+    times = [n[0] for n in notes]
+    tick = max(0.004, MAGNET_TICK_MS / 1000.0)
+    idle_tick = tick * 2.0
+
+    # Calibrate: set Windows cursor to playfield centre so virtual tracker
+    # starts from a known position. osu! ignores this absolute move.
+    cal_x = PF_LEFT + PF_W / 2
+    cal_y = PF_TOP + PF_H / 2
+    ctypes.windll.user32.SetCursorPos(int(cal_x), int(cal_y))
+    _virtual_cursor = [cal_x, cal_y]
+    time.sleep(0.05)  # Let the cursor settle
+
+    print(f"[magnet] sticky assist on ({len(notes)} notes, tick={MAGNET_TICK_MS:.0f}ms, raw-input safe)")
+    print(f"[magnet] calibrated virtual cursor at ({cal_x:.0f}, {cal_y:.0f})")
+
+    while not stop_evt.is_set():
+        if get_state("current_path") != worker_path:
+            break
+        if get_state("play_state") != "play":
+            break
+
+        live_ms = get_state("live_ms")
+        if live_ms is None or not notes:
+            time.sleep(idle_tick)
+            continue
+
+        live_ms = float(live_ms)
+        i = bisect.bisect_left(times, live_ms)
+        target = None
+        for j in (i - 1, i):
+            if 0 <= j < len(notes):
+                t, tx, ty, radius = notes[j]
+                if t - MAGNET_WINDOW_MS <= live_ms <= t + MAGNET_HOLD_AFTER_MS:
+                    target = (tx, ty, radius)
+                    break
+
+        if target is None:
+            time.sleep(idle_tick)
+            continue
+
+        tx, ty, radius = target
+        cx, cy = _virtual_cursor[0], _virtual_cursor[1]
+        dx, dy = tx - cx, ty - cy
+        dist = math.hypot(dx, dy)
+        reach = radius + MAGNET_TRIGGER_BUFFER_PX
+        stop_r = max(0.0, radius - MAGNET_STOP_INSET_PX)
+        active = stop_r < dist <= reach
+
+        if active:
+            edge_gap = dist - stop_r
+            step = min(MAGNET_MAX_STEP_PX, dist * MAGNET_PULL_STRENGTH, edge_gap)
+            if step > 0.5:
+                mx = int(round(dx / dist * step))
+                my = int(round(dy / dist * step))
+                if mx or my:
+                    mouse_move_relative(mx, my)
+                    _virtual_cursor[0] += mx
+                    _virtual_cursor[1] += my
+
+        time.sleep(tick)
+
+    set_status(STATE_IDLE)
+
+
 # Relax / click loop
 
 def relax_loop(objects, sync_wall, first_note_ms, rate):
     stop_event = get_state("stop_event")
-    stop_event.clear()
+
+    # Magnet is cursor-only and must stay cheap — skip the full auto timeline.
+    if MOVEMENT_MODE == "magnet":
+        magnet_cursor_worker(objects)
+        return
 
     moves   = []
     keys    = []
@@ -1171,7 +1512,7 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
         hit_wall = sync_wall + ((obj["time_ms"] + GAME_OFFSET_MS) - first_note_ms) / 1000.0 / rate
         end_wall = (sync_wall + ((obj["end_time_ms"] + GAME_OFFSET_MS) - first_note_ms) / 1000.0 / rate
                     if obj["end_time_ms"] is not None else None)
-        tx, ty = osu_to_screen(obj["x"], obj["y"])
+        tx, ty = target_screen_for_object(obj, len(moves))
         moves.append((hit_wall, tx, ty))
 
         if obj["is_spinner"] and end_wall:
@@ -1194,8 +1535,9 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
             lead_ms = min(JUMP_EARLY_LEAD_MAX_MS, dist / max(1e-6, JUMP_EARLY_LEAD_PX_PER_MS))
 
         press_wall = hit_wall + HIT_BIAS_MS / 1000.0 + jitter / 1000.0 - (lead_ms / 1000.0)
+        hold_ms = tap_hold_ms(gap_ms, len(keys))
         keys.append((press_wall, end_wall, key,
-                      obj["is_spinner"], obj["is_slider"], tx, ty))
+                      obj["is_spinner"], obj["is_slider"], tx, ty, hold_ms))
         prev_key_xy = (tx, ty)
 
     segments = build_movement_segments(objects, sync_wall, first_note_ms, rate)
@@ -1223,18 +1565,31 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
         if not segments:
             for wall, x, y in moves:
                 if stop_evt.is_set(): return
-                sleep_until(wall)
+                if not sleep_until(wall, stop_evt): return
                 mouse_move_capped(x, y)
             return
 
-        first_seg = segments[0]
-        if first_seg.get("type") == "normal":
-            mouse_move_capped(first_seg["x1"], first_seg["y1"])
-        else:
-            curve = first_seg.get("curve") or []
-            if curve:
-                ox, oy = curve[0]
-                mouse_move_capped(*osu_to_screen(ox, oy))
+        # Start from the user's current cursor position and travel to the
+        # first target during the lead-in.  This deliberately avoids an
+        # absolute first-frame move at map start.
+        first_target = moves[0][1:3] if moves else None
+        if first_target:
+            start_x, start_y = get_cursor_pos()
+            startup_end = segments[0]["start"] if segments else moves[0][0]
+            startup_start = max(now(), startup_end - STARTUP_SMOOTHING_MS / 1000.0)
+            startup_now = now()
+            while startup_now < startup_end and not stop_evt.is_set():
+                if startup_now < startup_start:
+                    smart_sleep_until(startup_start, stop_evt)
+                    startup_now = now()
+                    continue
+                u = max(0.0, min(1.0, (startup_now - startup_start) /
+                                  max(1e-6, startup_end - startup_start)))
+                eased = smooth_easing(u)
+                mouse_move_capped(lerp(start_x, first_target[0], eased),
+                                  lerp(start_y, first_target[1], eased))
+                smart_sleep_until(startup_now + 0.001, stop_evt)
+                startup_now = now()
 
         seg_i = 0
         total = len(segments)
@@ -1247,15 +1602,23 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
                 i_spin = max(0, bisect.bisect_right(spinner_starts, now_wall) - 1)
                 i_spin = min(i_spin, len(spinner_periods) - 1)
                 spin_start, spin_end = spinner_periods[i_spin]
+                spin_seed = (i_spin + 1) * 1.731 + _motion_rng.uniform(-0.2, 0.2)
+                spin_dir = -1.0 if _motion_rng.random() < 0.5 else 1.0
                 while now_wall < spin_end and not stop_evt.is_set():
                     elapsed = now_wall - spin_start
-                    angle = angular_velocity * elapsed
-                    mouse_move_capped(cx_spin + SPINNER_RADIUS * math.cos(angle),
-                                        cy_spin + SPINNER_RADIUS * math.sin(angle))
+                    angle = spin_dir * angular_velocity * elapsed
+                    wobble = 1.0 + 0.07 * math.sin(elapsed * 8.0 + spin_seed)
+                    rx = SPINNER_RADIUS * wobble
+                    ry = SPINNER_RADIUS * (0.92 + 0.06 * math.cos(elapsed * 6.7 + spin_seed))
+                    angle += 0.045 * math.sin(elapsed * 5.3 + spin_seed)
+                    # A shallow ellipse with changing phase is wrist/elbow
+                    # motion, rather than a perfect fixed-radius circle.
+                    mouse_move_capped(cx_spin + rx * math.cos(angle),
+                                        cy_spin + ry * math.sin(angle))
                     if (spin_end - spin_start) < 0.05:
-                        smart_sleep_until(now_wall + 0.0001)
+                        smart_sleep_until(now_wall + 0.0001, stop_evt)
                     else:
-                        smart_sleep_until(now_wall + 0.001)
+                        smart_sleep_until(now_wall + 0.001, stop_evt)
                     now_wall = now()
                 continue
 
@@ -1273,7 +1636,7 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
                     continue
 
                 if now_wall < start_wall:
-                    sleep_until(start_wall)
+                    if not sleep_until(start_wall, stop_evt): return
                     now_wall = now()
 
                 total_span = end_wall - start_wall
@@ -1308,9 +1671,9 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
 
                     mouse_move_capped(*osu_to_screen(ox, oy))
                     if total_span < 0.05:
-                        smart_sleep_until(now_wall + 0.0001)
+                        smart_sleep_until(now_wall + 0.0001, stop_evt)
                     else:
-                        smart_sleep_until(now_wall + 0.001)
+                        smart_sleep_until(now_wall + 0.001, stop_evt)
                     now_wall = now()
 
                 if now_wall >= end_wall:
@@ -1329,12 +1692,13 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
                 is_fast = seg.get("is_fast", False)
 
                 if now_wall < start_wall:
-                    sleep_until(start_wall)
+                    if not sleep_until(start_wall, stop_evt): return
                     now_wall = now()
 
                 if seg.get("locked", False):
+                    if stop_evt.is_set(): return
                     mouse_move_capped(x2, y2)
-                    sleep_until(end_wall)
+                    if not sleep_until(end_wall, stop_evt): return
                     seg_i += 1
                     continue
 
@@ -1351,26 +1715,26 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
                     dt = end_wall - start_wall
                     dx = x2 - x1
                     dy = y2 - y1
-                    
+
                     # Determine if arc should be used
                     use_arc = False
-                    if ARC_MODE and not seg.get("no_arc", False):
+                    if ARC_MODE and MOVEMENT_MODE != "linear" and not seg.get("no_arc", False):
                         jump_speed = seg.get("jump_distance", 0.0) / (dt * 1000.0) if dt > 0 else 0
                         if not (DISABLE_ARC_ON_FAST_JUMPS and jump_speed > MAX_JUMP_SPEED_PX_MS):
                             use_arc = True
-                    
+
                     # Busy-wait loop for fast jumps
                     while now_wall < end_wall and not stop_evt.is_set():
                         if is_in_interval(now_wall, spinner_starts, spinner_periods):
                             break
-                        
+
                         elapsed = now_wall - start_wall
                         if use_arc:
                             obj_idx = max(0, min(seg.get("obj_idx", 0), len(objects)-1))
                             osu1x, osu1y = screen_to_osu(x1, y1)
                             osu2x, osu2y = screen_to_osu(x2, y2)
                             dist_osu_px = math.hypot(osu2x-osu1x, osu2y-osu1y)
-                            
+
                             # For very large jumps (>200 osu px), don't use prediction
                             # Just use perpendicular arc like the first script
                             if dist_osu_px > 200:
@@ -1380,17 +1744,17 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
                             x, y = apply_predictive_arc(elapsed, dt, x1, y1, x2, y2,
                                                         dist_osu_px, pred_dir_x, pred_dir_y)
                         else:
-                            eased = smooth_easing(max(0.0, min(1.0, elapsed / dt)))
-                            x = x1 + dx * eased
-                            y = y1 + dy * eased
-                        
+                            eased, extra_x, extra_y = jump_progress(seg, max(0.0, min(1.0, elapsed / dt)))
+                            x = x1 + dx * eased + extra_x
+                            y = y1 + dy * eased + extra_y
+
                         mouse_move_capped(x, y, is_fast_segment=True)
                         now_wall = now()
                         # No sleep - busy wait for next frame
-                    
-                    # Final snap
-                    mouse_move_capped(x2, y2, is_fast_segment=True)
-                
+
+                    # The time-parametrized path already reaches the endpoint;
+                    # do not add a one-frame angular correction here.
+
                 else:
                     # Normal speed handling with sleep
                     while now_wall < end_wall and not stop_evt.is_set():
@@ -1401,11 +1765,12 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
                         if dt <= SEGMENT_MIN_DUR:
                             mouse_move_capped(x2, y2)
                             break
-                        
+
                         elapsed = now_wall - start_wall
                         in_special = is_in_slider_or_spinner(now_wall)
                         no_arc = seg.get("no_arc", False)
-                        use_arc = ARC_MODE and not in_special and not no_arc
+                        use_arc = (ARC_MODE and MOVEMENT_MODE != "linear"
+                                   and not in_special and not no_arc)
 
                         if use_arc:
                             # Disable arc for high-speed jumps
@@ -1422,36 +1787,34 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
                             x, y = apply_predictive_arc(elapsed, dt, x1, y1, x2, y2,
                                                         dist_osu_px, pred_dir_x, pred_dir_y)
                         else:
-                            eased = smooth_easing(elapsed / dt)
-                            x = x1 + (x2 - x1) * eased
-                            y = y1 + (y2 - y1) * eased
+                            eased, extra_x, extra_y = jump_progress(seg, elapsed / dt)
+                            x = x1 + (x2 - x1) * eased + extra_x
+                            y = y1 + (y2 - y1) * eased + extra_y
 
                         mouse_move_capped(x, y)
-                        
+
                         # Adaptive sleep based on remaining time
                         remaining = end_wall - now_wall
                         if remaining > 0.002:
-                            smart_sleep_until(now_wall + 0.001)
+                            smart_sleep_until(now_wall + 0.001, stop_evt)
                         else:
                             # Busy wait for final 2ms
-                            while now() < end_wall:
-                                mouse_move_capped(x2, y2)
                             break
-                        
+
                         now_wall = now()
 
-                    if now_wall >= end_wall:
-                        if not is_in_interval(now_wall, spinner_starts, spinner_periods):
-                            mouse_move_capped(x2, y2)
+                    # Leave the cursor at the last interpolated point instead
+                    # of issuing a sharp endpoint write after the loop.
 
             seg_i += 1
 
     def key_worker():
         stop_evt = get_state("stop_event")
-        for press_wall, end_wall, key, is_spinner, is_slider, sx, sy in keys:
+        for press_wall, end_wall, key, is_spinner, is_slider, sx, sy, hold_ms in keys:
             if stop_evt.is_set():
-                return
-            sleep_until(press_wall)
+                break
+            if not sleep_until(press_wall, stop_evt):
+                break
 
             if ENABLE_CLICK_POS_GATE and not stop_evt.is_set():
                 deadline = press_wall + (CLICK_POS_MAX_LATE_MS / 1000.0)
@@ -1463,19 +1826,29 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
                         break
                     time.sleep(CLICK_POS_POLL_SLEEP_S)
 
+            if stop_evt.is_set():
+                break
+
             key_down(key)
-            if is_spinner and end_wall:
-                sleep_until(end_wall)
-            elif is_slider and end_wall:
-                sleep_until(end_wall)
-            else:
-                sleep_until(press_wall + 0.020)
-            key_up(key)
+            try:
+                release_wall = (end_wall if (is_spinner or is_slider) and end_wall
+                                else press_wall + hold_ms / 1000.0)
+                sleep_until(release_wall, stop_evt)
+            finally:
+                key_up(key)
         set_status(STATE_IDLE)
 
-    if not RELAX_MODE:
-        threading.Thread(target=cursor_worker, daemon=True).start()
-    threading.Thread(target=key_worker, daemon=True).start()
+    # Magnet is cursor-only, but it still needs the cursor worker.  Relax
+    # remains the mode that suppresses ordinary cursor movement.
+    workers = []
+    if MOVEMENT_MODE == "magnet" or not RELAX_MODE:
+        workers.append(threading.Thread(target=cursor_worker, daemon=True))
+    if MOVEMENT_MODE != "magnet":
+        workers.append(threading.Thread(target=key_worker, daemon=True))
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
 
 
 # Hotkeys & tosu WebSocket
@@ -1483,12 +1856,27 @@ def relax_loop(objects, sync_wall, first_note_ms, rate):
 def on_f1():
     with state_lock:
         _state["_manual_armed"] = True
+        _state["_auto_started"] = False
     set_status(STATE_ARMED)
 
 
 def on_f2():
-    get_state("stop_event").set()
+    with state_lock:
+        _state["stop_event"].set()
+        _state["_manual_armed"] = False
+        _state["_auto_started"] = False
     set_status(STATE_IDLE)
+
+
+def toggle_relax_mode():
+    """Keep the R hotkey and the top-of-file mode flag in sync."""
+    global RELAX_MODE, MODE_RELAX
+    if MODE_MAGNET:
+        print("[mode] Magnet is enabled; R is ignored")
+        return
+    RELAX_MODE = not RELAX_MODE
+    MODE_RELAX = RELAX_MODE
+    print(f"[mode] Relax: {'on' if RELAX_MODE else 'off'}")
 
 
 def start_from_tosu_live(live_ms):
@@ -1499,13 +1887,40 @@ def start_from_tosu_live(live_ms):
     stop_event.set()
     relax_thread = get_state("relax_thread")
     if relax_thread and relax_thread.is_alive():
-        relax_thread.join(timeout=0.5)
-    first = hit_objects[0]["time_ms"]
-    rate  = get_state("speed_change")
+        relax_thread.join()
+    with state_lock:
+        if _state["play_state"] != "play" or not _state["_auto_started"]:
+            return
+        hit_objects = _state["hit_objects"]
+        if not hit_objects:
+            return
+        first = hit_objects[0]["time_ms"]
+        rate = _state["speed_change"]
     live_ms = float(live_ms)
-    sync_wall = now() - (((live_ms + GAME_OFFSET_MS) - first) / 1000.0 / rate)
-    set_state({"_sync_anchor": None})
-    set_status(STATE_RUNNING)
+    # `live` is already the current song-clock position.  Applying
+    # GAME_OFFSET_MS here as well as in the note schedule cancels the offset
+    # completely, which made that setting appear broken in the old version.
+    # When auto-start catches the early pre-start packet, osu! has inserted
+    # extra lead-in so the first object is not less than 1.8 s away.  Tosu can
+    # still report live near zero at that point.  Do not apply this correction
+    # when Q is pressed near the first note: then `live` already tracks the
+    # real timeline and the old anchor is the correct one.
+    extra_lead_ms = 0.0
+    if live_ms <= AUTO_PRESTART_CLOCK_MAX_MS:
+        extra_lead_ms = max(0.0, OSU_MIN_LEAD_IN_MS - first)
+    sync_wall = (now()
+                  - ((live_ms - first) / 1000.0 / rate)
+                  - MAP_DELAY_COMPENSATION_MS / 1000.0
+                  + extra_lead_ms / 1000.0 / rate)
+    with state_lock:
+        if _state["play_state"] != "play" or not _state["_auto_started"]:
+            return
+        stop_event = _state["stop_event"]
+        stop_event.clear()
+        old_status = _state["status"]
+        _state["status"] = STATE_RUNNING
+    if old_status != STATE_RUNNING:
+        print(f"[state] {old_status} -> {STATE_RUNNING}")
     new_thread = threading.Thread(target=relax_loop,
                                   args=(hit_objects, sync_wall, first, rate),
                                   daemon=True)
@@ -1520,39 +1935,105 @@ def on_message(ws, message):
         return
 
     state_name = data.get("state", {}).get("name")
+    live_ms = data.get("beatmap", {}).get("time", {}).get("live")
+    set_state({"play_state": state_name or "menu", "live_ms": live_ms})
+    tosu_cs = circle_size_from_tosu(data)
+    if tosu_cs is not None:
+        set_state({"circle_size": tosu_cs})
+
+    mouse_settings = data.get("settings", {}).get("mouse", {}) or {}
+    raw_input = mouse_settings.get("rawInput")
+    sensitivity = mouse_settings.get("sensitivity")
+    mouse_updates = {}
+    if raw_input is not None and raw_input != get_state("raw_input"):
+        mouse_updates["raw_input"] = bool(raw_input)
+        if MODE_MAGNET and raw_input:
+            print("[magnet] tosu reports raw input ON — disable High precision mouse")
+        elif MODE_MAGNET and not raw_input:
+            print("[magnet] raw input is OFF — cursor proximity checks can work")
+    if sensitivity is not None:
+        try:
+            sens_f = float(sensitivity)
+            mouse_updates["mouse_sensitivity"] = sens_f
+            global CURSOR_SENS
+            # Keep SendInput compensation matched to lazer's sensitivity.
+            if abs(CURSOR_SENS - sens_f) > 1e-6:
+                CURSOR_SENS = sens_f
+                print(f"[tosu] CURSOR_SENS synced to mouse sensitivity {sens_f}")
+        except (TypeError, ValueError):
+            pass
+    if mouse_updates:
+        set_state(mouse_updates)
+
     if state_name != "play":
-        set_state({"_auto_started": False, "_manual_armed": False, "_sync_anchor": None})
+        get_state("stop_event").set()
+        # Keep an arm made from the menu.  Q is documented as a pre-start
+        # hotkey, so clearing it on every menu websocket update made startup
+        # depend on exactly when Q was pressed.
+        set_state({"_auto_started": False})
         set_status(STATE_IDLE)
 
-    snap = get_state()
     new_rate = 1.0
     for mod in data.get("play", {}).get("mods", {}).get("array", []):
         sc = mod.get("settings", {}).get("speed_change")
         if sc is not None:
             new_rate = float(sc); break
+    snap = get_state()
     if new_rate != snap["speed_change"]:
         set_state({"speed_change": new_rate})
         print(f"[tosu] Rate: {new_rate}x")
-        snap = get_state()
 
-    if (AUTO_START and state_name == "play" and snap["hit_objects"]
-            and snap["_manual_armed"] and not snap["_auto_started"]):
-        live_ms = data.get("beatmap", {}).get("time", {}).get("live")
-        if live_ms is not None:
-            set_state({"_auto_started": True, "_manual_armed": False})
-            threading.Thread(target=start_from_tosu_live, args=(live_ms,), daemon=True).start()
-
+    # Load the current map before considering auto-start.  Tosu can deliver
+    # the first `play` update before its beatmap file path is available; the
+    # old version could then start with the previous map's objects.
     path = resolve_path(data)
     if path and path != snap["current_path"]:
         try:
             hit_objects = parse_osu_file(path)
+            live_cs = get_state("circle_size")
+            if live_cs is not None:
+                live_radius = hit_radius_from_circle_size(live_cs)
+                for obj in hit_objects:
+                    obj["hit_radius_osu"] = live_radius
             updated = get_state("speed_change")
-            set_state({"current_path": path, "hit_objects": hit_objects})
+            with state_lock:
+                _state["stop_event"].set()
+                _state.update({"current_path": path, "hit_objects": hit_objects,
+                               "_auto_started": False})
             bm = data.get("beatmap", {})
             print(f"[tosu] {bm.get('artist','?')} - {bm.get('title','?')} "
                   f"[{bm.get('version','?')}]  |  {len(hit_objects)} objects  |  {updated}x")
         except Exception as e:
             print(f"[tosu] Parse error: {e}")
+
+    # Tosu's converted CS includes active mod effects.  Refresh the radius on
+    # the current object list in case CS arrives after the beatmap path.
+    if tosu_cs is not None:
+        current_objects = get_state("hit_objects")
+        live_radius = hit_radius_from_circle_size(tosu_cs)
+        for obj in current_objects:
+            obj["hit_radius_osu"] = live_radius
+
+    snap = get_state()
+    if (AUTO_START and state_name == "play" and path
+            and path == snap["current_path"] and snap["hit_objects"]
+            and snap["_manual_armed"] and not snap["_auto_started"]
+            and live_ms is not None
+            and float(live_ms) >= AUTO_START_MIN_LIVE_MS):
+        # Claim the start under the lock so a burst of websocket messages can
+        # never launch two relax loops for the same map.
+        with state_lock:
+            if (_state["_manual_armed"] and not _state["_auto_started"]
+                    and _state["current_path"] == path):
+                _state["_auto_started"] = True
+                _state["_manual_armed"] = False
+                should_start = True
+            else:
+                should_start = False
+        if should_start:
+            print(f"[sync] {os.path.basename(path)} at live={float(live_ms):.1f}ms")
+            threading.Thread(target=start_from_tosu_live,
+                             args=(live_ms,), daemon=True).start()
 
 
 def on_error(ws, e):
@@ -1575,8 +2056,12 @@ def start_ws():
 # Main
 
 if __name__ == "__main__":
+    print(f"{RELEASE_NAME} ({RELEASE_VERSION})")
+    if MODE_MAGNET:
+        print("[mode] MAGNET — sticky near-note assist (you still aim & tap)")
+        print("[mode] Disable osu! High precision mouse, arm with Q")
     keyboard.add_hotkey(SYNC_HOTKEY, on_f1)
     keyboard.add_hotkey(STOP_HOTKEY, on_f2)
-    keyboard.add_hotkey("r", lambda: globals().update(RELAX_MODE=not RELAX_MODE))
+    keyboard.add_hotkey("r", toggle_relax_mode)
     start_ws()
     keyboard.wait()
