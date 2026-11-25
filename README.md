@@ -16,11 +16,12 @@ python -m pip install -r requirements.txt
 
 Start each run in this order:
 
-1. Open osu!lazer and get ready to play a map.
+1. Open osu!lazer.
 2. Open `tosu.exe` and make sure its WebSocket is available at
-   `localhost:24050`.
+   `localhost:24050` (it should do this automatically!)
 3. From this folder, run `python mainV1.py`.
 4. When the music starts, press **Q** to arm and sync the run.
+5. If it isnt synced, adjust in game song offset as the sync isn't and can't be made perfect.
 
 Tosu must be able to locate the selected `.osu` file in your songs folder.
 
