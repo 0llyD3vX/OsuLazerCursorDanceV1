@@ -6,22 +6,26 @@ multiplayer games; check osu!'s rules before using.**
 
 ## Setup
 
-1. Install Python 3.8 or newer and start [Tosu](https://github.com/KotRikD/tosu).
-2. Check and edit the settings at the top of `mainV1.py`, especially your
-   display/playfield dimensions and timing values.
-3. Install dependencies and launch:
+Install Python 3.8 or newer. Before starting, check and edit the settings at
+the top of `mainV1.py`, especially your display/playfield dimensions and timing
+values. Install the Python dependencies once:
 
-   ```powershell
-   python -m pip install -r requirements.txt
-   python mainV1.py
-   ```
+```powershell
+python -m pip install -r requirements.txt
+```
 
-Tosu's WebSocket should be available at `localhost:24050`. Tosu must be able to
-locate the selected `.osu` file in your songs folder.
+Start each run in this order:
+
+1. Open osu!lazer and get ready to play a map.
+2. Open `tosu.exe` and make sure its WebSocket is available at
+   `localhost:24050`.
+3. From this folder, run `python mainV1.py`.
+4. When the music starts, press **Q** to arm and sync the run.
+
+Tosu must be able to locate the selected `.osu` file in your songs folder.
 
 ## Controls and timing
 
-- Press **Q** when the music starts to arm and sync the run.
 - Press **W** to cancel or stop.
 - If timing is off, adjust `GAME_OFFSET_MS` for that song. Sync is not perfect;
   the 16 ms map-delay compensation is a starting point, not a guarantee.
